@@ -6,36 +6,50 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+using System.Globalization;
 using System.Linq;
+using System.Net.Http;
+using System.Threading.Tasks;
 
 namespace EasyPOS_Cardnet
 {
+    // Pasarela de consola entre las colas de EasyPOS en SQL Server y los procesadores Cardnet o Azul.
     class Program
     {
         private static string IpLocal = "192.168.10.50";
         private const int PortNumberLocal = 2018;
         private const int PortNumberRemote = 7060;
         private const int Timeout = 180000;
+
+        // Azul expone localmente la WebAPI que controla el Ingenico Lane 7000; esta aplicación no accede al puerto COM.
+        private const string AzulBaseUrl = "http://localhost:9000";
+        private static readonly HttpClient AzulHttpClient = new HttpClient
+        {
+            BaseAddress = new Uri(AzulBaseUrl),
+            // Las operaciones Azul tienen un único intento con un timeout de 45 segundos.
+            Timeout = TimeSpan.FromSeconds(45)
+        };
         private static bool keepRunning = true;
         private const string connectionString = "Server=192.168.10.50;Database=EasyPOS;User Id=sa;Password=1234;MultipleActiveResultSets=True;";
         
         static void Main(string[] args)
         {
-            string IpRemote;
-            string switch_on;
-            if (args.Length < 2)
+            // Formato obligatorio: EasyPOS_Cardnet <destino> <operacion> <proveedor>.
+            // Cada proceso atiende exclusivamente Cardnet o Azul, sin proveedor predeterminado.
+            if (args.Length != 3 ||
+                (!args[2].Equals("Cardnet", StringComparison.OrdinalIgnoreCase) &&
+                 !args[2].Equals("Azul", StringComparison.OrdinalIgnoreCase)))
             {
-                IpRemote = "All";
-                switch_on = "Cierres";
-                //Console.WriteLine("Favor proveer la direccion IP del Veriphone y el parametro de operacion (e.g., Ventas, Cierres, Cancelaciones).");
-                //return;
+                Console.Error.WriteLine("Formato correcto: EasyPOS_Cardnet <destino> <operacion> <proveedor>");
+                Console.Error.WriteLine("Valores permitidos para <proveedor>: Cardnet, Azul");
+                Environment.ExitCode = 1;
+                return;
             }
-            else
-            {
-                IpRemote = args[0];
-                switch_on = args[1];
 
-            }
+            string IpRemote = args[0];
+            string switch_on = args[1];
+            string proveedor = args[2].Equals("Cardnet", StringComparison.OrdinalIgnoreCase) ? "Cardnet" : "Azul";
             IpLocal = Dns.GetHostAddresses(Dns.GetHostName()).FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? "No IPv4 address found.";
                     
 
@@ -43,7 +57,7 @@ namespace EasyPOS_Cardnet
 
 
 
-            Console.WriteLine($"Recibiendo transacciones del POS{IpLocal} con la IP: {IpRemote} y operacion: {switch_on}");
+            Console.WriteLine($"Recibiendo transacciones del POS{IpLocal} con destino: {IpRemote}, operacion: {switch_on} y proveedor: {proveedor}");
 
             // Handle graceful shutdown
             Console.CancelKeyPress += (sender, e) => OnExit();
@@ -60,6 +74,12 @@ namespace EasyPOS_Cardnet
                     switch (switch_on)
                     {
                         case "Cierres":
+                            if (proveedor == "Azul")
+                            {
+                                ProcessAzulClosures(IpRemote);
+                                Environment.Exit(0);
+                                break;
+                            }
                            // ProcessTransaction_Cierres(IpRemote);
                             //cierre_estatico(IpRemote);
                             Console.WriteLine($"Cerrando los lotes del Panel con la IP: {IpRemote} y operacion de : {switch_on}");
@@ -77,9 +97,22 @@ namespace EasyPOS_Cardnet
                             Environment.Exit(0);
                             break;
                         case "Ventas":
-                           ProcessSalesTransactionsSQLVer1(IpRemote);
+                            if (proveedor == "Azul")
+                            {
+                                ProcessAzulSalesTransactionsSQL(IpRemote);
+                            }
+                            else
+                            {
+                                ProcessSalesTransactionsSQLVer1(IpRemote);
+                            }
                             break;
                         case "Cancelaciones":
+                            if (proveedor == "Azul")
+                            {
+                                ProcessAzulCancelations(IpRemote);
+                                Environment.Exit(0);
+                                break;
+                            }
                             //ProcessTransaction_Cancelations(IpRemote);
                             //ProcessCancelation("192.168.10.25",))
 
@@ -697,6 +730,309 @@ namespace EasyPOS_Cardnet
             }
         }
 
+        static void ProcessAzulSalesTransactionsSQL(string destino)
+        {
+            // Reutiliza la cola SQL de ventas; C200 y C300 no se convierten en ventas Azul.
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    string storedProcedure = destino == "All" ? "Procesar_POS_All" : "Procesar_POS";
+                    using (SqlCommand command = new SqlCommand(storedProcedure, connection))
+                    {
+                        command.CommandType = CommandType.StoredProcedure;
+                        if (destino != "All")
+                        {
+                            command.Parameters.AddWithValue("@VERIFON", destino);
+                        }
+
+                        connection.Open();
+                        using (SqlDataReader reader = command.ExecuteReader())
+                        {
+                            while (reader.Read())
+                            {
+                                int transactionId = reader["IDComunicacion"] != DBNull.Value ? (int)reader["IDComunicacion"] : 0;
+                                int amount = reader["Monto"] != DBNull.Value ? (int)reader["Monto"] : 0;
+                                string transactionType = reader["Transaccion"] as string ?? string.Empty;
+
+                                if (transactionType == "C200" || transactionType == "C300")
+                                {
+                                    SaveAzulUnsupportedTransaction(transactionId, transactionType);
+                                    continue;
+                                }
+
+                                ProcessAzulSale(transactionId, amount);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error al obtener ventas para Azul: {ex.Message}");
+            }
+        }
+
+        static void ProcessAzulSale(int transactionId, int amount)
+        {
+            // La WebAPI requiere el importe con punto decimal y exactamente dos posiciones.
+            string formattedAmount = Convert.ToDecimal(amount).ToString("0.00", CultureInfo.InvariantCulture);
+            AzulHttpResult result = SendAzulRequest($"/api/transaction/lane/sale/{formattedAmount}");
+
+            if (!result.IsValidJson)
+            {
+                Console.WriteLine($"Venta Azul {transactionId} no completada: {result.Error}");
+                SaveAzulSaleResult(transactionId, "99", null, result.StoredResponse);
+                return;
+            }
+
+            string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
+            LogAzulOperationStatus("Venta", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
+            SaveAzulSaleResult(transactionId, overallStatus, result.Json, result.Body);
+        }
+
+        static void ProcessAzulCancelations(string destino)
+        {
+            // ReferenceNumber permanece como int por compatibilidad con Cardnet y puede perder ceros iniciales.
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                using (SqlCommand command = new SqlCommand("dbo.Get_Cancelaciones", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.Parameters.AddWithValue("@VERIFON", destino);
+                    connection.Open();
+
+                    using (SqlDataReader reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            int id = (int)reader["Id"];
+                            int referenceNumber = (int)reader["ReferenceNumber"];
+                            ProcessAzulVoid(id, referenceNumber);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error al obtener anulaciones para Azul: {ex.Message}");
+            }
+        }
+
+        static void ProcessAzulVoid(int transactionId, int referenceNumber)
+        {
+            // La conversión a texto se limita al segmento InvoiceNumber de la ruta de Azul.
+            string invoiceNumber = referenceNumber.ToString(CultureInfo.InvariantCulture);
+            string escapedInvoiceNumber = Uri.EscapeDataString(invoiceNumber);
+            AzulHttpResult result = SendAzulRequest($"/api/transaction/lane/Void/{escapedInvoiceNumber}");
+            if (!result.IsValidJson)
+            {
+                Console.WriteLine($"Anulacion Azul {transactionId} no completada: {result.Error}");
+                SaveCancelationResults(transactionId, result.StoredResponse);
+                return;
+            }
+
+            string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
+            LogAzulOperationStatus("Anulacion", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
+            SaveCancelationResults(transactionId, result.Body);
+        }
+
+        static void ProcessAzulClosures(string destino)
+        {
+            // Los cierres pendientes se obtienen de SQL y se envían individualmente a CloseTotals.
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                using (SqlCommand command = new SqlCommand("dbo.Get_Cierres", connection))
+                {
+                    command.CommandType = CommandType.StoredProcedure;
+                    command.Parameters.AddWithValue("@VERIFON", destino);
+                    connection.Open();
+
+                    using (SqlDataReader reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            int id = (int)reader["Id"];
+                            ProcessAzulCloseTotals(destino, id);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error al obtener cierres para Azul: {ex.Message}");
+            }
+        }
+
+        static void ProcessAzulCloseTotals(string destino, int transactionId)
+        {
+            AzulHttpResult result = SendAzulRequest("/api/transaction/lane/CloseTotals");
+            if (!result.IsValidJson)
+            {
+                Console.WriteLine($"Cierre Azul {transactionId} no completado: {result.Error}");
+                LogCloseResponse(destino, result.StoredResponse, transactionId);
+                return;
+            }
+
+            string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
+            LogAzulOperationStatus("Cierre", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
+            LogCloseResponse(destino, result.Body, transactionId);
+        }
+
+        static AzulHttpResult SendAzulRequest(string route)
+        {
+            // Todas las operaciones Azul usan HTTP GET contra el servicio local, sin reintentos automáticos.
+            try
+            {
+                using (HttpResponseMessage response = AzulHttpClient.GetAsync(route).GetAwaiter().GetResult())
+                {
+                    string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        string error = $"Respuesta HTTP invalida ({(int)response.StatusCode} {response.ReasonPhrase})";
+                        return AzulHttpResult.Failure(body, error);
+                    }
+
+                    if (string.IsNullOrWhiteSpace(body))
+                    {
+                        return AzulHttpResult.Failure(body, "La WebAPI de Azul devolvio una respuesta vacia");
+                    }
+
+                    try
+                    {
+                        return AzulHttpResult.Success(body, JObject.Parse(body));
+                    }
+                    catch (JsonException ex)
+                    {
+                        return AzulHttpResult.Failure(body, $"JSON invalido: {ex.Message}");
+                    }
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                return AzulHttpResult.Failure(string.Empty, "Timeout de 45 segundos al comunicarse con Azul");
+            }
+            catch (HttpRequestException ex)
+            {
+                return AzulHttpResult.Failure(string.Empty, $"Servicio Azul no disponible: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                return AzulHttpResult.Failure(string.Empty, $"Error de comunicacion con Azul: {ex.Message}");
+            }
+        }
+
+        static void SaveAzulSaleResult(int transactionId, string status, JObject response, string rawResponse)
+        {
+            SaveTransactionResultVer1(
+                transactionId,
+                status ?? string.Empty,
+                string.Empty,
+                GetAzulValue(response, "MaskedPAN"),
+                GetAzulValue(response, "BatchNumber"),
+                GetAzulTransactionReferenceForSql(response),
+                GetAzulValue(response, "HostAuthorizationCode"),
+                GetAzulValue(response, "EntryMode"),
+                string.Empty,
+                CombineAzulDateAndTime(response),
+                GetAzulValue(response, "AID"),
+                GetAzulValue(response, "CardHolderName"),
+                GetAzulValue(response, "TerminalId"),
+                GetAzulValue(response, "MerchantId"),
+                string.Empty,
+                rawResponse ?? string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                GetAzulValue(response, "Currency"));
+        }
+
+        static void SaveAzulUnsupportedTransaction(int transactionId, string transactionType)
+        {
+            string message = $"Tipo de transaccion Azul no soportado: {transactionType}";
+            Console.WriteLine($"TransactionId: {transactionId}. {message}");
+            SaveAzulSaleResult(transactionId, "99", null, message);
+        }
+
+        static string CombineAzulDateAndTime(JObject response)
+        {
+            string date = GetAzulValue(response, "Date");
+            string time = GetAzulValue(response, "Time");
+
+            if (string.IsNullOrEmpty(date))
+            {
+                return time;
+            }
+
+            if (string.IsNullOrEmpty(time))
+            {
+                return date;
+            }
+
+            return $"{date} {time}";
+        }
+
+        static string GetAzulTransactionReferenceForSql(JObject response)
+        {
+            string transactionReference = GetAzulValue(response, "TransactionReference");
+            if (transactionReference.Length <= 4)
+            {
+                return transactionReference;
+            }
+
+            // SQL admite cuatro caracteres: la referencia larga queda solo en la respuesta completa de @Trama_Recibida.
+            Console.WriteLine("TransactionReference de Azul excede la longitud SQL disponible; se guardara vacio en @Reference.");
+            return string.Empty;
+        }
+
+        static string GetAzulValue(JObject response, params string[] candidateNames)
+        {
+            if (response == null)
+            {
+                return string.Empty;
+            }
+
+            JProperty property = response
+                .DescendantsAndSelf()
+                .OfType<JProperty>()
+                .FirstOrDefault(item => candidateNames.Any(name => item.Name.Equals(name, StringComparison.Ordinal)));
+
+            return property?.Value?.Type == JTokenType.Null ? string.Empty : property?.Value?.ToString() ?? string.Empty;
+        }
+
+        static string GetAzulOverallStatus(JObject response, string identifier)
+        {
+            string overallStatus = GetAzulValue(response, "TransactionOverallStatus");
+            if (!string.IsNullOrEmpty(overallStatus))
+            {
+                return overallStatus;
+            }
+
+            Console.WriteLine($"Operacion Azul {identifier} no exitosa: Respuesta Azul sin TransactionOverallStatus");
+            return "99";
+        }
+
+        static void LogAzulOperationStatus(string operation, string identifier, string overallStatus)
+        {
+            // Azul: 00=éxito, 01=rechazo/fallo operativo y 99=error técnico o respuesta incompleta.
+            if (overallStatus == "00")
+            {
+                Console.WriteLine($"{operation} Azul {identifier} exitosa.");
+            }
+            else if (overallStatus == "01")
+            {
+                Console.WriteLine($"{operation} Azul {identifier} rechazada.");
+            }
+            else
+            {
+                Console.WriteLine($"{operation} Azul {identifier} no exitosa. TransactionOverallStatus: {overallStatus}");
+            }
+        }
+
         static void OnExit()
         {
             keepRunning = false;
@@ -872,6 +1208,25 @@ namespace EasyPOS_Cardnet
                     cmd.ExecuteNonQuery();
                 }
             }
+        }
+    }
+
+    class AzulHttpResult
+    {
+        public string Body { get; private set; }
+        public JObject Json { get; private set; }
+        public string Error { get; private set; }
+        public bool IsValidJson => Json != null;
+        public string StoredResponse => string.IsNullOrWhiteSpace(Body) ? Error : $"{Error}. Respuesta: {Body}";
+
+        public static AzulHttpResult Success(string body, JObject json)
+        {
+            return new AzulHttpResult { Body = body, Json = json, Error = string.Empty };
+        }
+
+        public static AzulHttpResult Failure(string body, string error)
+        {
+            return new AzulHttpResult { Body = body ?? string.Empty, Json = null, Error = error };
         }
     }
 
