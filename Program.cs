@@ -777,8 +777,9 @@ namespace EasyPOS_Cardnet
 
         static void ProcessAzulSale(int transactionId, decimal amount)
         {
-            // La WebAPI requiere el importe con punto decimal y exactamente dos posiciones.
-            string formattedAmount = amount.ToString("0.00", CultureInfo.InvariantCulture);
+            // Procesar_POS entrega el importe en unidades menores; la WebAPI de Azul requiere unidades monetarias.
+            decimal azulAmount = amount / 100m;
+            string formattedAmount = azulAmount.ToString("0.00", CultureInfo.InvariantCulture);
             AzulHttpResult result = SendAzulRequest($"/api/transaction/lane/sale/{formattedAmount}");
 
             if (!result.IsValidJson)
