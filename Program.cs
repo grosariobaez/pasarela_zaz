@@ -752,7 +752,9 @@ namespace EasyPOS_Cardnet
                             while (reader.Read())
                             {
                                 int transactionId = reader["IDComunicacion"] != DBNull.Value ? (int)reader["IDComunicacion"] : 0;
-                                int amount = reader["Monto"] != DBNull.Value ? (int)reader["Monto"] : 0;
+                                decimal amount = reader["Monto"] != DBNull.Value
+                                    ? Convert.ToDecimal(reader["Monto"], CultureInfo.InvariantCulture)
+                                    : 0m;
                                 string transactionType = reader["Transaccion"] as string ?? string.Empty;
 
                                 if (transactionType == "C200" || transactionType == "C300")
@@ -773,10 +775,10 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        static void ProcessAzulSale(int transactionId, int amount)
+        static void ProcessAzulSale(int transactionId, decimal amount)
         {
             // La WebAPI requiere el importe con punto decimal y exactamente dos posiciones.
-            string formattedAmount = Convert.ToDecimal(amount).ToString("0.00", CultureInfo.InvariantCulture);
+            string formattedAmount = amount.ToString("0.00", CultureInfo.InvariantCulture);
             AzulHttpResult result = SendAzulRequest($"/api/transaction/lane/sale/{formattedAmount}");
 
             if (!result.IsValidJson)
