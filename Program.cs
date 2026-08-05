@@ -66,7 +66,10 @@ namespace EasyPOS_Cardnet
            
 
 
-            // Main loop
+            // Ventas permanece consultando la cola hasta recibir Ctrl+C. Las rutas Azul de
+            // cancelaciones y cierres terminan después de procesar las filas recuperadas.
+            // Una consulta puede devolver más de una fila: la ejecución procesa todas las
+            // operaciones pendientes que coincidan con el destino indicado.
             while (keepRunning)
             {
                 try
@@ -732,7 +735,8 @@ namespace EasyPOS_Cardnet
 
         static void ProcessAzulSalesTransactionsSQL(string destino)
         {
-            // Reutiliza la cola SQL de ventas; C200 y C300 no se convierten en ventas Azul.
+            // Reutiliza la cola SQL de ventas y procesa todas las filas devueltas.
+            // C200 (consulta) y C300 (cuotas) no se convierten en ventas Azul.
             try
             {
                 using (SqlConnection connection = new SqlConnection(connectionString))
@@ -887,6 +891,8 @@ namespace EasyPOS_Cardnet
         static AzulHttpResult SendAzulRequest(string route)
         {
             // Todas las operaciones Azul usan HTTP GET contra el servicio local, sin reintentos automáticos.
+            // Un rechazo comercial llega como JSON válido y se interpreta fuera de este método;
+            // solo transporte, HTTP, timeout o JSON inválido producen un resultado técnico fallido.
             try
             {
                 using (HttpResponseMessage response = AzulHttpClient.GetAsync(route).GetAwaiter().GetResult())
