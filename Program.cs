@@ -30,26 +30,33 @@ namespace EasyPOS_Cardnet
             // Las operaciones Azul tienen un único intento con un timeout de 45 segundos.
             Timeout = TimeSpan.FromSeconds(45)
         };
-        private static bool keepRunning = true;
+        private static volatile bool keepRunning = true;
+        private static readonly object terminalLock = new object();
+        private static int salesWaiting;
         private const string connectionString = "Server=192.168.10.50;Database=EasyPOS;User Id=sa;Password=1234;MultipleActiveResultSets=True;";
         
         static void Main(string[] args)
         {
-            // Formato obligatorio: EasyPOS_Cardnet <destino> <operacion> <proveedor>.
-            // Cada proceso atiende exclusivamente Cardnet o Azul, sin proveedor predeterminado.
-            if (args.Length != 3 ||
-                (!args[2].Equals("Cardnet", StringComparison.OrdinalIgnoreCase) &&
-                 !args[2].Equals("Azul", StringComparison.OrdinalIgnoreCase)))
+            // Formato recomendado: EasyPOS_Cardnet <destino> <proveedor>.
+            // El formato anterior con una operacion explicita se conserva temporalmente.
+            bool unifiedMode = args.Length == 2;
+            bool legacyMode = args.Length == 3;
+            string providerArgument = unifiedMode ? args[1] : legacyMode ? args[2] : string.Empty;
+
+            if ((!unifiedMode && !legacyMode) ||
+                (!providerArgument.Equals("Cardnet", StringComparison.OrdinalIgnoreCase) &&
+                 !providerArgument.Equals("Azul", StringComparison.OrdinalIgnoreCase)))
             {
-                Console.Error.WriteLine("Formato correcto: EasyPOS_Cardnet <destino> <operacion> <proveedor>");
+                Console.Error.WriteLine("Formato recomendado: EasyPOS_Cardnet <destino> <proveedor>");
+                Console.Error.WriteLine("Formato compatible: EasyPOS_Cardnet <destino> <operacion> <proveedor>");
                 Console.Error.WriteLine("Valores permitidos para <proveedor>: Cardnet, Azul");
                 Environment.ExitCode = 1;
                 return;
             }
 
             string IpRemote = args[0];
-            string switch_on = args[1];
-            string proveedor = args[2].Equals("Cardnet", StringComparison.OrdinalIgnoreCase) ? "Cardnet" : "Azul";
+            string switch_on = legacyMode ? args[1] : "Todas";
+            string proveedor = providerArgument.Equals("Cardnet", StringComparison.OrdinalIgnoreCase) ? "Cardnet" : "Azul";
             IpLocal = Dns.GetHostAddresses(Dns.GetHostName()).FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)?.ToString() ?? "No IPv4 address found.";
                     
 
@@ -57,11 +64,21 @@ namespace EasyPOS_Cardnet
 
 
 
-            Console.WriteLine($"Recibiendo transacciones del POS{IpLocal} con destino: {IpRemote}, operacion: {switch_on} y proveedor: {proveedor}");
+            Console.WriteLine($"Recibiendo transacciones del POS {IpLocal} con destino: {IpRemote}, operacion: {switch_on} y proveedor: {proveedor}");
 
             // Handle graceful shutdown
-            Console.CancelKeyPress += (sender, e) => OnExit();
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                e.Cancel = true;
+                OnExit();
+            };
             AppDomain.CurrentDomain.ProcessExit += (sender, e) => OnExit();
+
+            if (unifiedMode)
+            {
+                RunUnifiedMode(IpRemote, proveedor);
+                return;
+            }
 
            
 
@@ -357,6 +374,7 @@ namespace EasyPOS_Cardnet
                     dynamic jsonResponse = JsonConvert.DeserializeObject(response);
                     SaveCancelationResults(idTrn, jsonResponse);
                     Console.WriteLine($"Referencia: {referencia}, Response: {response}");
+                    return;
                 }
                 if (i == 2) // Last attempt failed
                 {
@@ -739,6 +757,100 @@ namespace EasyPOS_Cardnet
             catch (Exception ex)
             {
                 Console.WriteLine($"Unexpected error while processing transaction {transactionId}: {ex.Message}");
+            }
+        }
+
+        static void RunUnifiedMode(string destino, string proveedor)
+        {
+            Console.WriteLine("Modo unificado activo. Prioridad: Ventas; luego Cancelaciones y Cierres.");
+            Console.WriteLine("Presione Ctrl+C para detener el servicio.");
+
+            Task salesWorker = Task.Run(() => RunUnifiedWorker(
+                "Ventas",
+                1000,
+                true,
+                () =>
+                {
+                    if (proveedor == "Azul")
+                        ProcessAzulSalesTransactionsSQL(destino);
+                    else
+                        ProcessSalesTransactionsSQLVer1(destino);
+                }));
+
+            Task cancelationsWorker = Task.Run(() => RunUnifiedWorker(
+                "Cancelaciones",
+                3000,
+                false,
+                () =>
+                {
+                    if (proveedor == "Azul")
+                        ProcessAzulCancelations(destino);
+                    else
+                        ProcessTransaction_Cancelations(destino);
+                }));
+
+            Task closuresWorker = Task.Run(() => RunUnifiedWorker(
+                "Cierres",
+                3000,
+                false,
+                () =>
+                {
+                    if (proveedor == "Azul")
+                        ProcessAzulClosures(destino);
+                    else
+                        ProcessTransaction_Cierres(destino);
+                }));
+
+            Task.WaitAll(salesWorker, cancelationsWorker, closuresWorker);
+        }
+
+        static void RunUnifiedWorker(string operation, int pollingIntervalMilliseconds, bool isSalesWorker, Action processPending)
+        {
+            while (keepRunning)
+            {
+                try
+                {
+                    if (isSalesWorker)
+                    {
+                        Interlocked.Exchange(ref salesWaiting, 1);
+                        lock (terminalLock)
+                        {
+                            processPending();
+                        }
+                        Interlocked.Exchange(ref salesWaiting, 0);
+                    }
+                    else if (Volatile.Read(ref salesWaiting) == 0)
+                    {
+                        lock (terminalLock)
+                        {
+                            // Una venta que comenzo a esperar tiene prioridad sobre las otras operaciones.
+                            if (Volatile.Read(ref salesWaiting) == 0)
+                                processPending();
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error en el trabajador de {operation}: {ex.Message}");
+                }
+                finally
+                {
+                    if (isSalesWorker)
+                        Interlocked.Exchange(ref salesWaiting, 0);
+                }
+
+                SleepWhileRunning(pollingIntervalMilliseconds);
+            }
+        }
+
+        static void SleepWhileRunning(int milliseconds)
+        {
+            const int interval = 100;
+            int elapsed = 0;
+            while (keepRunning && elapsed < milliseconds)
+            {
+                Thread.Sleep(interval);
+                elapsed += interval;
             }
         }
 

@@ -45,33 +45,38 @@ La aplicación no abre directamente el puerto COM. El servicio local de Azul es 
 
 ## Ejecución
 
-El proveedor es obligatorio y solo admite `Cardnet` o `Azul`:
+El modo unificado es el formato recomendado. El proveedor es obligatorio y solo admite `Cardnet` o `Azul`:
 
 ```text
-EasyPOS_Cardnet <destino> <operación> <proveedor>
+EasyPOS_Cardnet <destino> <proveedor>
 ```
 
 Ejemplos genéricos:
 
 ```text
-EasyPOS_Cardnet <destino> Ventas Cardnet
-EasyPOS_Cardnet <destino> Cancelaciones Cardnet
-EasyPOS_Cardnet <destino> Cierres Cardnet
-EasyPOS_Cardnet <destino> Ventas Azul
-EasyPOS_Cardnet <destino> Cancelaciones Azul
-EasyPOS_Cardnet <destino> Cierres Azul
+EasyPOS_Cardnet <destino> Cardnet
+EasyPOS_Cardnet <destino> Azul
 ```
 
-Las operaciones reconocidas por el programa son `Ventas`, `Cancelaciones` y `Cierres`. En ventas, el destino `All` solicita al procedimiento existente que consulte todos los destinos; cualquier otro valor se envía como identificador de destino a SQL Server.
+Cada instancia unificada consulta las colas de `Ventas`, `Cancelaciones` y `Cierres` del proveedor indicado. En ventas, el destino `All` solicita al procedimiento existente que consulte todos los destinos; cualquier otro valor se envía como identificador de destino a SQL Server.
 
 Una ejecución atiende un solo proveedor. No existe proveedor predeterminado y una invocación con argumentos ausentes, adicionales o inválidos termina con error.
 
+El formato anterior permanece disponible temporalmente para facilitar la transición:
+
+```text
+EasyPOS_Cardnet <destino> <operación> <proveedor>
+```
+
+Las operaciones admitidas en ese formato son `Ventas`, `Cancelaciones` y `Cierres`.
+
 ### Comportamiento de la ejecución
 
-- `Ventas` consulta continuamente la cola hasta detener el proceso con `Ctrl+C`.
+- El modo unificado mantiene tres trabajadores: ventas consulta cada segundo; cancelaciones y cierres, cada tres segundos.
+- Ventas tiene prioridad. Un bloqueo compartido garantiza que solo una operación se comunique con el terminal a la vez.
+- Los trabajadores continúan consultando sus colas hasta detener el proceso con `Ctrl+C`.
 - Cada consulta procesa todas las filas pendientes que SQL Server devuelva para el destino; no se limita a una sola transacción.
 - Antes de una prueba controlada se debe confirmar que no existan otras operaciones pendientes para el mismo destino.
-- `Cancelaciones` y `Cierres` de Azul terminan la aplicación después de procesar las filas recuperadas.
 - Una instancia iniciada para Cardnet nunca procesa operaciones mediante Azul, y viceversa.
 
 ## Configuración Azul
