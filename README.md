@@ -97,7 +97,7 @@ Los importes se envían con punto decimal y dos posiciones. Azul no implementa v
 ### Tratamiento de respuestas Azul
 
 - Una respuesta HTTP exitosa debe contener JSON válido.
-- `TransactionOverallStatus = "00"` se registra como operación exitosa.
+- `TransactionOverallStatus = "00"` se interpreta como éxito y la venta Azul se guarda en `Procesador_pagos.Estatus` como `Successful`.
 - `TransactionOverallStatus = "01"` se registra como rechazo comercial; no es una excepción técnica.
 - Timeout, servicio no disponible, HTTP no exitoso, JSON inválido o ausencia de `TransactionOverallStatus` se registran con estado `99`.
 - Cualquier otro estado recibido se conserva como resultado no exitoso sin provocar una caída innecesaria.
@@ -117,11 +117,15 @@ La solución reutiliza la estructura y las colas existentes de SQL Server median
 
 Las respuestas completas de Azul se conservan en los campos existentes destinados a la trama o resultado de cada operación.
 
+La columna existente `Procesador_pagos.Company` identifica el procesador utilizado. Las ventas nuevas se guardan con `Azul` o `Cardnet`; los registros históricos anteriores a esta integración pueden permanecer vacíos.
+
 ### Mapeo de persistencia Azul
 
-La venta Azul reutiliza `Procesa_POS_Res`. Los campos con equivalencia se extraen del JSON, incluyendo PAN enmascarado, lote, autorización, modo de entrada, fecha/hora, AID, titular, terminal, comercio y moneda. Los campos sin equivalencia se envían vacíos. El JSON completo se guarda como trama recibida.
+La venta Azul reutiliza `Procesa_POS_Res`. Los campos con equivalencia se extraen del JSON, incluyendo PAN enmascarado, lote, autorización, modo de entrada, fecha/hora, AID, titular, terminal, comercio y moneda. `InvoiceNumber` se guarda en `Reference` y `TransactionReference` en `rnn`. Los campos sin equivalencia se envían vacíos. El JSON completo se guarda como trama recibida.
 
-Las anulaciones reutilizan `Voucher_SaveCanceledresult` y los cierres reutilizan `GuardaCierresLote`. No se agregaron tablas, columnas ni procedimientos para Azul.
+Las anulaciones reutilizan `Voucher_SaveCanceledresult` y los cierres reutilizan `GuardaCierresLote`. En `Cancelacion_Venta`, el flujo Azul conserva el JSON completo y guarda por separado el procesador, estado, referencia financiera, monto, autorización, respuestas host/terminal, modo de entrada, lote, fecha/hora, terminal, comercio y producto. No se duplican PAN, criptogramas ni recibos en columnas estructuradas.
+
+En cierres Azul, el JSON original permanece en `CloseResponse`. El resumen incluido en `Receipts` se parsea para guardar en `ProcessCierreLote` el estado, terminal, fecha/hora, cantidad e importe bruto de ventas, además de la cantidad e importe de anulaciones. El total neto puede obtenerse como `amount - cancelAmount`.
 
 ## Organización del código
 
@@ -164,10 +168,9 @@ El servicio debe aparecer en estado `Running` y la prueba TCP debe devolver `Tcp
 
 ## Riesgos aceptados
 
-1. `ReferenceNumber` es numérico y puede perder ceros iniciales requeridos por `InvoiceNumber` de Azul.
-2. `TransactionReference` solo se guarda en la columna `Reference` cuando tiene cuatro caracteres o menos.
-3. Una referencia más larga no se trunca: `Reference` queda vacío y el valor permanece únicamente en `Trama_Recibida`.
-4. Estos riesgos fueron aceptados para evitar cambios adicionales en la base de datos.
+1. `Procesador_pagos.Reference` y `Cancelacion_Venta.ReferenceNumber` deben permanecer como `varchar(50)` para conservar el `InvoiceNumber` de Azul, incluidos sus ceros iniciales.
+2. Cardnet continúa validando y convirtiendo su referencia numérica antes de comunicarse con `ECRti.Framework`.
+3. La respuesta original de cada procesador permanece en `Trama_Recibida` para auditoría.
 
 ## Pruebas
 

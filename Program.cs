@@ -275,7 +275,13 @@ namespace EasyPOS_Cardnet
                     {
                         int idtrn = (int)reader["Id"];
                         int host = (int)reader["Host"];
-                        int referencia = (int)reader["ReferenceNumber"];
+                        string referenceNumber = Convert.ToString(reader["ReferenceNumber"], CultureInfo.InvariantCulture) ?? string.Empty;
+                        if (!int.TryParse(referenceNumber, NumberStyles.None, CultureInfo.InvariantCulture, out int referencia))
+                        {
+                            Console.WriteLine($"Cancelacion Cardnet {idtrn} no procesada: ReferenceNumber no es numerico.");
+                            continue;
+                        }
+
                         ProcessCancelation(idtrn, host, referencia, IpRemote);
                     }
                 }
@@ -620,7 +626,7 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        static void SaveTransactionResult(int transactionId, string status, string product, string cardNumber, string lote, string referencia, string authorizationNumber, string mode, string rrn, string fechahora, string appid, string holderName, string terminalid, string merchantid, string acquired, string response, string salesIndicator, string calculationAccepted, string marginRate,string  amountdcc, string displayrate,string transactioncurr)
+        static void SaveTransactionResult(int transactionId, string status, string product, string cardNumber, string lote, string referencia, string authorizationNumber, string mode, string rrn, string fechahora, string appid, string holderName, string terminalid, string merchantid, string acquired, string response, string salesIndicator, string calculationAccepted, string marginRate,string  amountdcc, string displayrate,string transactioncurr, string company = "Cardnet")
         {
             using (SqlConnection connection = new SqlConnection(connectionString))
             {
@@ -649,6 +655,7 @@ namespace EasyPOS_Cardnet
                 command.Parameters.AddWithValue("@displayrate", displayrate);
                 command.Parameters.AddWithValue("@transactioncurr", transactioncurr);
                 command.Parameters.AddWithValue("@Trama_Recibida", response);
+                command.Parameters.AddWithValue("@Company", company);
 
                 connection.Open();
                 command.ExecuteNonQuery();
@@ -679,7 +686,8 @@ namespace EasyPOS_Cardnet
             string marginRate, 
             string amountdcc, 
             string displayrate, 
-            string transactioncurr)
+            string transactioncurr,
+            string company = "Cardnet")
         {
             try
             {
@@ -712,6 +720,7 @@ namespace EasyPOS_Cardnet
                         command.Parameters.AddWithValue("@displayrate", displayrate ?? DBNull.Value.ToString());
                         command.Parameters.AddWithValue("@transactioncurr", transactioncurr ?? DBNull.Value.ToString());
                         command.Parameters.AddWithValue("@Trama_Recibida", response ?? DBNull.Value.ToString());
+                        command.Parameters.AddWithValue("@Company", company ?? DBNull.Value.ToString());
 
                         // Execute the command
                         connection.Open();
@@ -795,12 +804,14 @@ namespace EasyPOS_Cardnet
 
             string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
             LogAzulOperationStatus("Venta", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
-            SaveAzulSaleResult(transactionId, overallStatus, result.Json, result.Body);
+            // Procesador_pagos usa la etiqueta legible "Successful" para ventas Azul aprobadas.
+            string sqlStatus = overallStatus == "00" ? "Successful" : overallStatus;
+            SaveAzulSaleResult(transactionId, sqlStatus, result.Json, result.Body);
         }
 
         static void ProcessAzulCancelations(string destino)
         {
-            // ReferenceNumber permanece como int por compatibilidad con Cardnet y puede perder ceros iniciales.
+            // ReferenceNumber se conserva como texto para mantener íntegro el InvoiceNumber de Azul.
             try
             {
                 using (SqlConnection connection = new SqlConnection(connectionString))
@@ -815,7 +826,7 @@ namespace EasyPOS_Cardnet
                         while (reader.Read())
                         {
                             int id = (int)reader["Id"];
-                            int referenceNumber = (int)reader["ReferenceNumber"];
+                            string referenceNumber = Convert.ToString(reader["ReferenceNumber"], CultureInfo.InvariantCulture) ?? string.Empty;
                             ProcessAzulVoid(id, referenceNumber);
                         }
                     }
@@ -827,22 +838,68 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        static void ProcessAzulVoid(int transactionId, int referenceNumber)
+        static void ProcessAzulVoid(int transactionId, string referenceNumber)
         {
-            // La conversión a texto se limita al segmento InvoiceNumber de la ruta de Azul.
-            string invoiceNumber = referenceNumber.ToString(CultureInfo.InvariantCulture);
-            string escapedInvoiceNumber = Uri.EscapeDataString(invoiceNumber);
+            string escapedInvoiceNumber = Uri.EscapeDataString(referenceNumber);
             AzulHttpResult result = SendAzulRequest($"/api/transaction/lane/Void/{escapedInvoiceNumber}");
             if (!result.IsValidJson)
             {
                 Console.WriteLine($"Anulacion Azul {transactionId} no completada: {result.Error}");
-                SaveCancelationResults(transactionId, result.StoredResponse);
+                SaveAzulCancelationResult(transactionId, "99", null, result.StoredResponse);
                 return;
             }
 
             string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
             LogAzulOperationStatus("Anulacion", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
-            SaveCancelationResults(transactionId, result.Body);
+            SaveAzulCancelationResult(transactionId, overallStatus, result.Json, result.Body);
+        }
+
+        static void SaveAzulCancelationResult(int transactionId, string status, JObject response, string rawResponse)
+        {
+            decimal? amount = null;
+            if (decimal.TryParse(
+                GetAzulValue(response, "Amount"),
+                NumberStyles.Number,
+                CultureInfo.InvariantCulture,
+                out decimal parsedAmount))
+            {
+                amount = parsedAmount;
+            }
+
+            DateTime? transactionDateTime = null;
+            string dateAndTime = $"{GetAzulValue(response, "Date")} {GetAzulValue(response, "Time")}";
+            if (DateTime.TryParseExact(
+                dateAndTime,
+                "yyMMdd HHmmss",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out DateTime parsedDateTime))
+            {
+                transactionDateTime = parsedDateTime;
+            }
+
+            using (SqlConnection connection = new SqlConnection(connectionString))
+            using (SqlCommand command = new SqlCommand("Voucher_SaveCanceledresult", connection))
+            {
+                command.CommandType = CommandType.StoredProcedure;
+                command.Parameters.AddWithValue("@Id", transactionId);
+                command.Parameters.AddWithValue("@ResultMessage", rawResponse ?? string.Empty);
+                command.Parameters.AddWithValue("@Company", "Azul");
+                command.Parameters.AddWithValue("@Estatus", status == "00" ? "Successful" : status ?? "99");
+                command.Parameters.AddWithValue("@TransactionReference", GetAzulValue(response, "TransactionReference"));
+                command.Parameters.AddWithValue("@Amount", (object)amount ?? DBNull.Value);
+                command.Parameters.AddWithValue("@Aprobacion", GetAzulValue(response, "HostAuthorizationCode"));
+                command.Parameters.AddWithValue("@HostResponse", GetAzulValue(response, "HostResponse"));
+                command.Parameters.AddWithValue("@TerminalResponse", GetAzulValue(response, "TerminalResponse"));
+                command.Parameters.AddWithValue("@EntryMode", GetAzulValue(response, "EntryMode"));
+                command.Parameters.AddWithValue("@BatchNumber", GetAzulValue(response, "BatchNumber"));
+                command.Parameters.AddWithValue("@FechaHora", (object)transactionDateTime ?? DBNull.Value);
+                command.Parameters.AddWithValue("@TerminalId", GetAzulValue(response, "TerminalId"));
+                command.Parameters.AddWithValue("@MerchantId", GetAzulValue(response, "MerchantId"));
+                command.Parameters.AddWithValue("@Product", GetAzulValue(response, "RangeName"));
+                connection.Open();
+                command.ExecuteNonQuery();
+            }
         }
 
         static void ProcessAzulClosures(string destino)
@@ -885,7 +942,7 @@ namespace EasyPOS_Cardnet
 
             string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
             LogAzulOperationStatus("Cierre", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
-            LogCloseResponse(destino, result.Body, transactionId);
+            LogAzulCloseResponse(destino, transactionId, overallStatus, result.Json, result.Body);
         }
 
         static AzulHttpResult SendAzulRequest(string route)
@@ -941,10 +998,10 @@ namespace EasyPOS_Cardnet
                 string.Empty,
                 GetAzulValue(response, "MaskedPAN"),
                 GetAzulValue(response, "BatchNumber"),
-                GetAzulTransactionReferenceForSql(response),
+                GetAzulValue(response, "InvoiceNumber"),
                 GetAzulValue(response, "HostAuthorizationCode"),
                 GetAzulValue(response, "EntryMode"),
-                string.Empty,
+                GetAzulValue(response, "TransactionReference"),
                 CombineAzulDateAndTime(response),
                 GetAzulValue(response, "AID"),
                 GetAzulValue(response, "CardHolderName"),
@@ -957,7 +1014,8 @@ namespace EasyPOS_Cardnet
                 string.Empty,
                 string.Empty,
                 string.Empty,
-                GetAzulValue(response, "Currency"));
+                GetAzulValue(response, "Currency"),
+                "Azul");
         }
 
         static void SaveAzulUnsupportedTransaction(int transactionId, string transactionType)
@@ -983,19 +1041,6 @@ namespace EasyPOS_Cardnet
             }
 
             return $"{date} {time}";
-        }
-
-        static string GetAzulTransactionReferenceForSql(JObject response)
-        {
-            string transactionReference = GetAzulValue(response, "TransactionReference");
-            if (transactionReference.Length <= 4)
-            {
-                return transactionReference;
-            }
-
-            // SQL admite cuatro caracteres: la referencia larga queda solo en la respuesta completa de @Trama_Recibida.
-            Console.WriteLine("TransactionReference de Azul excede la longitud SQL disponible; se guardara vacio en @Reference.");
-            return string.Empty;
         }
 
         static string GetAzulValue(JObject response, params string[] candidateNames)
@@ -1216,6 +1261,66 @@ namespace EasyPOS_Cardnet
 
                     cmd.ExecuteNonQuery();
                 }
+            }
+        }
+
+        private static void LogAzulCloseResponse(string ipRemota, int idtrn, string status, JObject response, string rawResponse)
+        {
+            string receipt = GetAzulValue(response, "Receipts");
+            int salesQuantity = 0;
+            decimal salesAmount = 0m;
+
+            foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(
+                receipt,
+                @"(?m)^\s*(?:MASTERCARD|VISA|AMEX|DISCOVER)\s+(\d+)\s+([\d,]+\.\d{2})\s*$"))
+            {
+                salesQuantity += int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+                salesAmount += decimal.Parse(match.Groups[2].Value, NumberStyles.Number, CultureInfo.InvariantCulture);
+            }
+
+            System.Text.RegularExpressions.Match annulmentMatch = System.Text.RegularExpressions.Regex.Match(
+                receipt,
+                @"(?m)^\s*ANULACIONES\s+(\d+)\s+([\d,]+\.\d{2})\s*$");
+            int cancelQuantity = annulmentMatch.Success
+                ? int.Parse(annulmentMatch.Groups[1].Value, CultureInfo.InvariantCulture)
+                : 0;
+            decimal cancelAmount = annulmentMatch.Success
+                ? decimal.Parse(annulmentMatch.Groups[2].Value, NumberStyles.Number, CultureInfo.InvariantCulture)
+                : 0m;
+
+            System.Text.RegularExpressions.Match terminalMatch = System.Text.RegularExpressions.Regex.Match(
+                receipt,
+                @"(?m)^\s*TERMINAL ID:\s*(\S+)\s*$");
+            string terminalId = terminalMatch.Success ? terminalMatch.Groups[1].Value : string.Empty;
+
+            DateTime? transactionDateTime = null;
+            string dateAndTime = $"{GetAzulValue(response, "Date")} {GetAzulValue(response, "Time")}";
+            if (DateTime.TryParseExact(
+                dateAndTime,
+                "yyMMdd HHmmss",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out DateTime parsedDateTime))
+            {
+                transactionDateTime = parsedDateTime;
+            }
+
+            using (SqlConnection connection = new SqlConnection(connectionString))
+            using (SqlCommand command = new SqlCommand("GuardaCierresLote", connection))
+            {
+                command.CommandType = CommandType.StoredProcedure;
+                command.Parameters.AddWithValue("@IpRemota", ipRemota);
+                command.Parameters.AddWithValue("@CloseResponse", rawResponse ?? string.Empty);
+                command.Parameters.AddWithValue("@IDComunicacion", idtrn);
+                command.Parameters.AddWithValue("@Estatus", status ?? string.Empty);
+                command.Parameters.AddWithValue("@TerminalId", terminalId);
+                command.Parameters.AddWithValue("@FechaHora", (object)transactionDateTime ?? DBNull.Value);
+                command.Parameters.AddWithValue("@Quantity", salesQuantity);
+                command.Parameters.AddWithValue("@Amount", salesAmount);
+                command.Parameters.AddWithValue("@CancelQuantity", cancelQuantity);
+                command.Parameters.AddWithValue("@CancelAmount", cancelAmount);
+                connection.Open();
+                command.ExecuteNonQuery();
             }
         }
     }
