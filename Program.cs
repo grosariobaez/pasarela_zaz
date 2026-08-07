@@ -11,6 +11,12 @@ using System.Globalization;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
+using System.Text;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Hosting.WindowsServices;
+using Serilog;
+using Serilog.Events;
 
 namespace EasyPOS_Cardnet
 {
@@ -33,11 +39,33 @@ namespace EasyPOS_Cardnet
         private static volatile bool keepRunning = true;
         private static readonly object terminalLock = new object();
         private static int salesWaiting;
+        private const string AutomaticSqlDestination = "__AUTO_SQL_ROUTE__";
         private const string connectionString = "Server=192.168.10.50;Database=EasyPOS;User Id=sa;Password=1234;MultipleActiveResultSets=True;";
         
         static void Main(string[] args)
         {
-            // Formato recomendado: EasyPOS_Cardnet <destino> <proveedor>.
+            if (WindowsServiceHelpers.IsWindowsService())
+            {
+                if (!TryGetServiceArguments(args, out string serviceDestination, out string serviceProvider))
+                {
+                    Environment.ExitCode = 1;
+                    return;
+                }
+
+                RunAsWindowsService(serviceDestination, serviceProvider);
+                return;
+            }
+
+            if (args.Length > 0 &&
+                (args[0].Equals("--service", StringComparison.OrdinalIgnoreCase) ||
+                 args[0].Equals("--service-auto", StringComparison.OrdinalIgnoreCase)))
+            {
+                Console.Error.WriteLine("Los parametros de servicio solo pueden utilizarlos el Administrador de servicios de Windows.");
+                Environment.ExitCode = 1;
+                return;
+            }
+
+            // Formato recomendado: EasyPOS_Gateway <destino> <proveedor>.
             // El formato anterior con una operacion explicita se conserva temporalmente.
             bool unifiedMode = args.Length == 2;
             bool legacyMode = args.Length == 3;
@@ -47,8 +75,8 @@ namespace EasyPOS_Cardnet
                 (!providerArgument.Equals("Cardnet", StringComparison.OrdinalIgnoreCase) &&
                  !providerArgument.Equals("Azul", StringComparison.OrdinalIgnoreCase)))
             {
-                Console.Error.WriteLine("Formato recomendado: EasyPOS_Cardnet <destino> <proveedor>");
-                Console.Error.WriteLine("Formato compatible: EasyPOS_Cardnet <destino> <operacion> <proveedor>");
+                Console.Error.WriteLine("Formato recomendado: EasyPOS_Gateway <destino> <proveedor>");
+                Console.Error.WriteLine("Formato compatible: EasyPOS_Gateway <destino> <operacion> <proveedor>");
                 Console.Error.WriteLine("Valores permitidos para <proveedor>: Cardnet, Azul");
                 Environment.ExitCode = 1;
                 return;
@@ -760,6 +788,200 @@ namespace EasyPOS_Cardnet
             }
         }
 
+        static bool TryGetServiceArguments(string[] args, out string destination, out string provider)
+        {
+            destination = string.Empty;
+            provider = string.Empty;
+
+            if (args.Length == 2 &&
+                args[0].Equals("--service-auto", StringComparison.OrdinalIgnoreCase) &&
+                args[1].Equals("Azul", StringComparison.OrdinalIgnoreCase))
+            {
+                destination = AutomaticSqlDestination;
+                provider = "Azul";
+                return true;
+            }
+
+            if (args.Length != 3 || !args[0].Equals("--service", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (!args[2].Equals("Cardnet", StringComparison.OrdinalIgnoreCase) &&
+                !args[2].Equals("Azul", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (string.IsNullOrWhiteSpace(args[1]))
+                return false;
+
+            destination = args[1];
+            provider = args[2].Equals("Cardnet", StringComparison.OrdinalIgnoreCase) ? "Cardnet" : "Azul";
+            return true;
+        }
+
+        static string ResolveSqlRouteLocalAddress()
+        {
+            SqlConnectionStringBuilder builder = new SqlConnectionStringBuilder(connectionString);
+            string serverName = builder.DataSource ?? string.Empty;
+            int sqlPort = 1433;
+
+            if (serverName.StartsWith("tcp:", StringComparison.OrdinalIgnoreCase))
+                serverName = serverName.Substring(4);
+
+            int commaIndex = serverName.LastIndexOf(',');
+            if (commaIndex >= 0)
+            {
+                if (int.TryParse(serverName.Substring(commaIndex + 1), NumberStyles.None, CultureInfo.InvariantCulture, out int parsedPort))
+                    sqlPort = parsedPort;
+                serverName = serverName.Substring(0, commaIndex);
+            }
+
+            int instanceIndex = serverName.IndexOf('\\');
+            if (instanceIndex >= 0)
+                serverName = serverName.Substring(0, instanceIndex);
+
+            IPAddress sqlAddress = Dns.GetHostAddresses(serverName)
+                .FirstOrDefault(address => address.AddressFamily == AddressFamily.InterNetwork);
+            if (sqlAddress == null)
+                throw new InvalidOperationException("No fue posible resolver una direccion IPv4 para SQL Server.");
+
+            using (Socket routeSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+            {
+                routeSocket.Connect(new IPEndPoint(sqlAddress, sqlPort));
+                string localAddress = ((IPEndPoint)routeSocket.LocalEndPoint).Address.ToString();
+                if (string.IsNullOrWhiteSpace(localAddress) || localAddress.StartsWith("127.", StringComparison.Ordinal))
+                    throw new InvalidOperationException("No fue posible determinar la direccion IPv4 LAN para acceder a SQL Server.");
+                return localAddress;
+            }
+        }
+
+        static void RunAsWindowsService(string destination, string provider)
+        {
+            string logPath = System.IO.Path.Combine(AppContext.BaseDirectory, "logs", "PaymentGateway-.log");
+            Log.Logger = new LoggerConfiguration()
+                .MinimumLevel.Information()
+                .WriteTo.File(
+                    logPath,
+                    rollingInterval: RollingInterval.Day,
+                    retainedFileCountLimit: 60,
+                    rollOnFileSizeLimit: true,
+                    fileSizeLimitBytes: 20000000)
+                .CreateLogger();
+
+            Console.SetOut(new ServiceLogWriter(LogEventLevel.Information));
+            Console.SetError(new ServiceLogWriter(LogEventLevel.Error));
+
+            try
+            {
+                IHost host = Host.CreateDefaultBuilder()
+                    .UseWindowsService(options =>
+                    {
+                        options.ServiceName = "EasyPOS.PaymentGateway";
+                    })
+                    .ConfigureServices(services =>
+                    {
+                        services.Configure<HostOptions>(options =>
+                        {
+                            // Permite terminar limpiamente una solicitud Azul que ya este en curso.
+                            options.ShutdownTimeout = TimeSpan.FromSeconds(60);
+                        });
+                        services.AddSingleton<IHostedService>(new PaymentGatewayWorker(destination, provider));
+                    })
+                    .Build();
+
+                host.Run();
+            }
+            finally
+            {
+                Log.CloseAndFlush();
+            }
+        }
+
+        private sealed class ServiceLogWriter : System.IO.TextWriter
+        {
+            private readonly LogEventLevel level;
+            private readonly StringBuilder buffer = new StringBuilder();
+            private readonly object writerLock = new object();
+
+            public ServiceLogWriter(LogEventLevel level)
+            {
+                this.level = level;
+            }
+
+            public override Encoding Encoding => Encoding.UTF8;
+
+            public override void Write(char value)
+            {
+                lock (writerLock)
+                {
+                    if (value == '\n')
+                    {
+                        FlushBuffer();
+                    }
+                    else if (value != '\r')
+                    {
+                        buffer.Append(value);
+                    }
+                }
+            }
+
+            public override void WriteLine(string value)
+            {
+                lock (writerLock)
+                {
+                    if (buffer.Length > 0)
+                    {
+                        buffer.Append(value);
+                        FlushBuffer();
+                    }
+                    else
+                    {
+                        Log.Write(level, "{Message}", value ?? string.Empty);
+                    }
+                }
+            }
+
+            private void FlushBuffer()
+            {
+                if (buffer.Length == 0)
+                    return;
+
+                Log.Write(level, "{Message}", buffer.ToString());
+                buffer.Clear();
+            }
+        }
+
+        private sealed class PaymentGatewayWorker : BackgroundService
+        {
+            private readonly string destination;
+            private readonly string provider;
+
+            public PaymentGatewayWorker(string destination, string provider)
+            {
+                this.destination = destination;
+                this.provider = provider;
+            }
+
+            protected override Task ExecuteAsync(CancellationToken stoppingToken)
+            {
+                IpLocal = Dns.GetHostAddresses(Dns.GetHostName())
+                    .FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork)?.ToString()
+                    ?? "No IPv4 address found.";
+
+                stoppingToken.Register(OnExit);
+                return Task.Run(() =>
+                {
+                    string effectiveDestination = destination;
+                    if (provider == "Azul" && destination == AutomaticSqlDestination)
+                    {
+                        effectiveDestination = ResolveSqlRouteLocalAddress();
+                        IpLocal = effectiveDestination;
+                        Console.WriteLine($"Destino SQL Azul detectado automaticamente: {effectiveDestination}");
+                    }
+
+                    RunUnifiedMode(effectiveDestination, provider);
+                }, stoppingToken);
+            }
+        }
+
         static void RunUnifiedMode(string destino, string proveedor)
         {
             Console.WriteLine("Modo unificado activo. Prioridad: Ventas; luego Cancelaciones y Cierres.");
@@ -1107,7 +1329,7 @@ namespace EasyPOS_Cardnet
             SaveTransactionResultVer1(
                 transactionId,
                 status ?? string.Empty,
-                string.Empty,
+                GetAzulValue(response, "RangeName"),
                 GetAzulValue(response, "MaskedPAN"),
                 GetAzulValue(response, "BatchNumber"),
                 GetAzulValue(response, "InvoiceNumber"),
@@ -1121,11 +1343,11 @@ namespace EasyPOS_Cardnet
                 GetAzulValue(response, "MerchantId"),
                 string.Empty,
                 rawResponse ?? string.Empty,
+                GetAzulValue(response, "DccIndicator"),
                 string.Empty,
-                string.Empty,
-                string.Empty,
-                string.Empty,
-                string.Empty,
+                GetAzulValue(response, "DccMargin"),
+                GetAzulValue(response, "DccOriginalAmount"),
+                GetAzulValue(response, "DccRate"),
                 GetAzulValue(response, "Currency"),
                 "Azul");
         }

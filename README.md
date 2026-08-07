@@ -48,14 +48,14 @@ La aplicación no abre directamente el puerto COM. El servicio local de Azul es 
 El modo unificado es el formato recomendado. El proveedor es obligatorio y solo admite `Cardnet` o `Azul`:
 
 ```text
-EasyPOS_Cardnet <destino> <proveedor>
+EasyPOS_Gateway <destino> <proveedor>
 ```
 
 Ejemplos genéricos:
 
 ```text
-EasyPOS_Cardnet <destino> Cardnet
-EasyPOS_Cardnet <destino> Azul
+EasyPOS_Gateway <destino> Cardnet
+EasyPOS_Gateway <destino> Azul
 ```
 
 Cada instancia unificada consulta las colas de `Ventas`, `Cancelaciones` y `Cierres` del proveedor indicado. En ventas, el destino `All` solicita al procedimiento existente que consulte todos los destinos; cualquier otro valor se envía como identificador de destino a SQL Server.
@@ -65,7 +65,7 @@ Una ejecución atiende un solo proveedor. No existe proveedor predeterminado y u
 El formato anterior permanece disponible temporalmente para facilitar la transición:
 
 ```text
-EasyPOS_Cardnet <destino> <operación> <proveedor>
+EasyPOS_Gateway <destino> <operación> <proveedor>
 ```
 
 Las operaciones admitidas en ese formato son `Ventas`, `Cancelaciones` y `Cierres`.
@@ -128,6 +128,8 @@ La columna existente `Procesador_pagos.Company` identifica el procesador utiliza
 
 La venta Azul reutiliza `Procesa_POS_Res`. Los campos con equivalencia se extraen del JSON, incluyendo PAN enmascarado, lote, autorización, modo de entrada, fecha/hora, AID, titular, terminal, comercio y moneda. `InvoiceNumber` se guarda en `Reference` y `TransactionReference` en `rnn`. Los campos sin equivalencia se envían vacíos. El JSON completo se guarda como trama recibida.
 
+Para ventas DCC de Azul, `DccIndicator`, `DccMargin`, `DccOriginalAmount`, `DccRate` y `Currency` se guardan respectivamente en `salesIndicator`, `marginRate`, `amountdcc`, `displayrate` y `transactioncurr`. `calculationAccepted` permanece vacío porque Azul no devuelve un equivalente directo. `RangeName` se guarda en `Product`.
+
 Las anulaciones reutilizan `Voucher_SaveCanceledresult` y los cierres reutilizan `GuardaCierresLote`. En `Cancelacion_Venta`, el flujo Azul conserva el JSON completo y guarda por separado el procesador, estado, referencia financiera, monto, autorización, respuestas host/terminal, modo de entrada, lote, fecha/hora, terminal, comercio y producto. No se duplican PAN, criptogramas ni recibos en columnas estructuradas.
 
 En cierres Azul, el JSON original permanece en `CloseResponse`. El resumen incluido en `Receipts` se parsea para guardar en `ProcessCierreLote` el estado, terminal, fecha/hora, cantidad e importe bruto de ventas, además de la cantidad e importe de anulaciones. El total neto puede obtenerse como `amount - cancelAmount`.
@@ -159,6 +161,60 @@ dotnet build EasyPOS_Cardnet.sln -t:Rebuild
 ```
 
 La dependencia `ECRti.Framework` puede producir la advertencia `NU1701` porque fue publicada para .NET Framework y se restaura en el proyecto `net6.0`. Esta advertencia ya existe en la solución y no impide la compilación actual.
+
+## Servicio de Windows
+
+La aplicación puede ejecutarse como el servicio nativo `EasyPOS.PaymentGateway`. Primero publique el ejecutable desde la raíz del repositorio:
+
+```powershell
+dotnet publish EasyPOS_Cardnet.csproj -c Release -r win-x64 --self-contained false
+```
+
+Después, abra PowerShell como administrador e instale una instancia. El proveedor y el destino de la cola SQL quedan parametrizados durante la instalación:
+
+```powershell
+.\Install-Service.ps1 -Provider Azul
+```
+
+Para Cardnet:
+
+```powershell
+.\Install-Service.ps1 -Provider Cardnet -QueueDestination 192.168.10.200
+```
+
+En Cardnet, `QueueDestination` identifica la cola SQL y la IP de la terminal. En Azul no se solicita ese parámetro: el servicio detecta la IPv4 LAN que Windows utiliza para alcanzar SQL Server y la usa para seleccionar sus filas. La comunicación con el Lane continúa realizándose exclusivamente por la WebAPI local y USB.
+
+El servicio se registra con inicio automático. Solo comienza inmediatamente si se usa `-StartService` en el script o se marca esa opción en el instalador gráfico. Su estado puede consultarse con:
+
+```powershell
+Get-Service EasyPOS.PaymentGateway
+```
+
+Los registros se guardan junto al ejecutable publicado, bajo `logs\PaymentGateway-<fecha>.log`. La cuenta que ejecute el servicio debe tener permiso de escritura sobre esa carpeta y acceso a SQL Server. Para eliminar el servicio:
+
+```powershell
+.\Uninstall-Service.ps1
+```
+
+Si necesita cambiar proveedor o destino, desinstale el servicio y vuelva a instalarlo con los nuevos parámetros. No edite manualmente la ruta binaria registrada por Windows.
+
+### Instalador gráfico
+
+El instalador solicita el proveedor y si debe iniciar el servicio al finalizar. Solo cuando se selecciona Cardnet solicita el destino de cola SQL/IP de terminal; Azul lo detecta automáticamente. Se instala en `Program Files`, registra el servicio con inicio automático y agrega su desinstalador a Windows.
+
+Para construirlo se requiere Inno Setup 6:
+
+```powershell
+.\Build-Installer.ps1
+```
+
+El resultado se genera en:
+
+```text
+installer\output\EasyPOS-Gateway-Setup.exe
+```
+
+La publicación incluida es autocontenida para Windows x64; el equipo destino no necesita instalar el runtime de .NET 6 por separado. Por seguridad, la opción de iniciar el servicio al finalizar aparece desmarcada inicialmente.
 
 ## Operación del servicio Azul
 
