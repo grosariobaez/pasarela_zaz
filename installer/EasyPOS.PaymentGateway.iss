@@ -1,5 +1,5 @@
 #define MyAppName "EasyPOS Gateway"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "ZAZ"
 #define MyAppExeName "EasyPOS_Gateway.exe"
 #define MyServiceName "EasyPOS.PaymentGateway"

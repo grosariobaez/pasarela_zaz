@@ -1076,71 +1076,278 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        static void ProcessAzulSalesTransactionsSQL(string destino)
+        static void ProcessAzulSalesTransactionsSQL(
+            string destino
+        )
         {
-            // Reutiliza la cola SQL de ventas y procesa todas las filas devueltas.
-            // C200 (consulta) y C300 (cuotas) no se convierten en ventas Azul.
             try
             {
-                using (SqlConnection connection = new SqlConnection(connectionString))
+                using (
+                    SqlConnection connection =
+                        new SqlConnection(connectionString)
+                )
+                using (
+                    SqlCommand command =
+                        new SqlCommand(
+                            "dbo.Procesar_AZUL_POS",
+                            connection
+                        )
+                )
                 {
-                    string storedProcedure = destino == "All" ? "Procesar_POS_All" : "Procesar_POS";
-                    using (SqlCommand command = new SqlCommand(storedProcedure, connection))
+                    command.CommandType =
+                        CommandType.StoredProcedure;
+
+                    if (
+                        string.Equals(
+                            destino,
+                            "All",
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                    )
                     {
-                        command.CommandType = CommandType.StoredProcedure;
-                        if (destino != "All")
+                        command.Parameters.Add(
+                            "@VERIFON",
+                            SqlDbType.VarChar,
+                            50
+                        ).Value =
+                            DBNull.Value;
+                    }
+                    else
+                    {
+                        command.Parameters.Add(
+                            "@VERIFON",
+                            SqlDbType.VarChar,
+                            50
+                        ).Value =
+                            destino;
+                    }
+
+                    connection.Open();
+
+                    using (
+                        SqlDataReader reader =
+                            command.ExecuteReader()
+                    )
+                    {
+                        if (!reader.Read())
                         {
-                            command.Parameters.AddWithValue("@VERIFON", destino);
+                            return;
                         }
 
-                        connection.Open();
-                        using (SqlDataReader reader = command.ExecuteReader())
+                        int transactionId =
+                            reader["IDComunicacion"] != DBNull.Value
+                            ? Convert.ToInt32(
+                                reader["IDComunicacion"]
+                            )
+                            : 0;
+
+                        decimal amount =
+                            reader["Monto"] != DBNull.Value
+                            ? Convert.ToDecimal(
+                                reader["Monto"],
+                                CultureInfo.InvariantCulture
+                            )
+                            : 0m;
+
+                        string transactionType =
+                            reader["Transaccion"] == DBNull.Value
+                            ? string.Empty
+                            : Convert.ToString(
+                                reader["Transaccion"],
+                                CultureInfo.InvariantCulture
+                            );
+
+                        if (transactionId <= 0)
                         {
-                            while (reader.Read())
-                            {
-                                int transactionId = reader["IDComunicacion"] != DBNull.Value ? (int)reader["IDComunicacion"] : 0;
-                                decimal amount = reader["Monto"] != DBNull.Value
-                                    ? Convert.ToDecimal(reader["Monto"], CultureInfo.InvariantCulture)
-                                    : 0m;
-                                string transactionType = reader["Transaccion"] as string ?? string.Empty;
+                            Console.WriteLine(
+                                "AZUL: IDComunicacion invalido."
+                            );
 
-                                if (transactionType == "C200" || transactionType == "C300")
-                                {
-                                    SaveAzulUnsupportedTransaction(transactionId, transactionType);
-                                    continue;
-                                }
-
-                                ProcessAzulSale(transactionId, amount);
-                            }
+                            return;
                         }
+
+                        Console.WriteLine(
+                            $"AZUL reclamando transaccion " +
+                            $"{transactionId}, " +
+                            $"tipo {transactionType}, " +
+                            $"monto menor {amount}."
+                        );
+
+                        if (
+                            transactionType == "C200" ||
+                            transactionType == "C300"
+                        )
+                        {
+                            SaveAzulUnsupportedTransaction(
+                                transactionId,
+                                transactionType
+                            );
+
+                            return;
+                        }
+
+                        ProcessAzulSale(
+                            transactionId,
+                            amount
+                        );
                     }
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error al obtener ventas para Azul: {ex.Message}");
+                Console.WriteLine(
+                    "Error obteniendo transaccion AZUL: " +
+                    ex.ToString()
+                );
             }
         }
 
-        static void ProcessAzulSale(int transactionId, decimal amount)
+        static void ProcessAzulSale(
+            int transactionId,
+            decimal amount
+        )
         {
-            // Procesar_POS entrega el importe en unidades menores; la WebAPI de Azul requiere unidades monetarias.
-            decimal azulAmount = amount / 100m;
-            string formattedAmount = azulAmount.ToString("0.00", CultureInfo.InvariantCulture);
-            AzulHttpResult result = SendAzulRequest($"/api/transaction/lane/sale/{formattedAmount}");
+            decimal azulAmount =
+                amount / 100m;
+
+            string formattedAmount =
+                azulAmount.ToString(
+                    "0.00",
+                    CultureInfo.InvariantCulture
+                );
+
+            Console.WriteLine(
+                $"AZUL inicio venta. " +
+                $"ID={transactionId}, " +
+                $"Monto={formattedAmount}"
+            );
+
+            AzulHttpResult result =
+                SendAzulRequest(
+                    "/api/transaction/lane/sale/" +
+                    formattedAmount
+                );
 
             if (!result.IsValidJson)
             {
-                Console.WriteLine($"Venta Azul {transactionId} no completada: {result.Error}");
-                SaveAzulSaleResult(transactionId, "99", null, result.StoredResponse);
+                Console.WriteLine(
+                    $"AZUL resultado tecnico incierto. " +
+                    $"ID={transactionId}. " +
+                    $"Error={result.Error}"
+                );
+
+                bool saved =
+                    TrySaveAzulSaleResult(
+                        transactionId,
+                        "99",
+                        null,
+                        result.StoredResponse
+                    );
+
+                if (!saved)
+                {
+                    Log.Error(
+                        "CRITICAL AZUL persistence failure. " +
+                        "TransactionId={TransactionId}, " +
+                        "Status={Status}, Response={Response}",
+                        transactionId,
+                        "99",
+                        result.StoredResponse
+                    );
+                }
+
                 return;
             }
 
-            string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
-            LogAzulOperationStatus("Venta", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
-            // Procesador_pagos usa la etiqueta legible "Successful" para ventas Azul aprobadas.
-            string sqlStatus = overallStatus == "00" ? "Successful" : overallStatus;
-            SaveAzulSaleResult(transactionId, sqlStatus, result.Json, result.Body);
+            string overallStatus =
+                GetAzulOverallStatus(
+                    result.Json,
+                    transactionId.ToString(
+                        CultureInfo.InvariantCulture
+                    )
+                );
+
+            string sqlStatus;
+
+            if (overallStatus == "00")
+            {
+                sqlStatus = "Successful";
+            }
+            else if (overallStatus == "01")
+            {
+                sqlStatus = "01";
+            }
+            else
+            {
+                sqlStatus = "99";
+            }
+
+            Console.WriteLine(
+                $"AZUL respuesta recibida. " +
+                $"ID={transactionId}, " +
+                $"OverallStatus={overallStatus}, " +
+                $"SQLStatus={sqlStatus}, " +
+                $"Invoice={GetAzulValue(result.Json, "InvoiceNumber")}, " +
+                $"Authorization=" +
+                $"{GetAzulValue(result.Json, "HostAuthorizationCode")}"
+            );
+
+            Log.Information(
+                "AZUL SALE RESPONSE " +
+                "TransactionId={TransactionId} " +
+                "Status={Status} " +
+                "InvoiceNumber={InvoiceNumber} " +
+                "Authorization={Authorization} " +
+                "TransactionReference={TransactionReference} " +
+                "Response={Response}",
+                transactionId,
+                sqlStatus,
+                GetAzulValue(
+                    result.Json,
+                    "InvoiceNumber"
+                ),
+                GetAzulValue(
+                    result.Json,
+                    "HostAuthorizationCode"
+                ),
+                GetAzulValue(
+                    result.Json,
+                    "TransactionReference"
+                ),
+                result.Body
+            );
+
+            bool resultSaved =
+                TrySaveAzulSaleResult(
+                    transactionId,
+                    sqlStatus,
+                    result.Json,
+                    result.Body
+                );
+
+            if (!resultSaved)
+            {
+                Log.Error(
+                    "CRITICAL: AZUL responded but SQL " +
+                    "could not persist result. " +
+                    "TransactionId={TransactionId}, " +
+                    "Status={Status}, " +
+                    "Invoice={Invoice}, " +
+                    "Authorization={Authorization}, " +
+                    "Response={Response}",
+                    transactionId,
+                    sqlStatus,
+                    GetAzulValue(
+                        result.Json,
+                        "InvoiceNumber"
+                    ),
+                    GetAzulValue(
+                        result.Json,
+                        "HostAuthorizationCode"
+                    ),
+                    result.Body
+                );
+            }
         }
 
         static void ProcessAzulCancelations(string destino)
@@ -1324,39 +1531,253 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        static void SaveAzulSaleResult(int transactionId, string status, JObject response, string rawResponse)
+        static bool TrySaveAzulSaleResult(
+            int transactionId,
+            string status,
+            JObject response,
+            string rawResponse
+        )
         {
-            SaveTransactionResultVer1(
-                transactionId,
-                status ?? string.Empty,
-                GetAzulValue(response, "RangeName"),
-                GetAzulValue(response, "MaskedPAN"),
-                GetAzulValue(response, "BatchNumber"),
-                GetAzulValue(response, "InvoiceNumber"),
-                GetAzulValue(response, "HostAuthorizationCode"),
-                GetAzulValue(response, "EntryMode"),
-                GetAzulValue(response, "TransactionReference"),
-                CombineAzulDateAndTime(response),
-                GetAzulValue(response, "AID"),
-                GetAzulValue(response, "CardHolderName"),
-                GetAzulValue(response, "TerminalId"),
-                GetAzulValue(response, "MerchantId"),
-                string.Empty,
-                rawResponse ?? string.Empty,
-                GetAzulValue(response, "DccIndicator"),
-                string.Empty,
-                GetAzulValue(response, "DccMargin"),
-                GetAzulValue(response, "DccOriginalAmount"),
-                GetAzulValue(response, "DccRate"),
-                GetAzulValue(response, "Currency"),
-                "Azul");
-        }
+            const int maxAttempts = 3;
 
+            for (
+                int attempt = 1;
+                attempt <= maxAttempts;
+                attempt++
+            )
+            {
+                try
+                {
+                    using (
+                        SqlConnection connection =
+                            new SqlConnection(connectionString)
+                    )
+                    using (
+                        SqlCommand command =
+                            new SqlCommand(
+                                "dbo.Procesa_POS_Res",
+                                connection
+                            )
+                    )
+                    {
+                        command.CommandType =
+                            CommandType.StoredProcedure;
+
+                        command.Parameters.AddWithValue(
+                            "@ID_Transaction",
+                            transactionId
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Aprobacion",
+                            GetAzulValue(
+                                response,
+                                "HostAuthorizationCode"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Estatus",
+                            status ?? string.Empty
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Product",
+                            GetAzulValue(
+                                response,
+                                "RangeName"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@CardNumber",
+                            GetAzulValue(
+                                response,
+                                "MaskedPAN"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Lote",
+                            GetAzulValue(
+                                response,
+                                "BatchNumber"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Reference",
+                            GetAzulValue(
+                                response,
+                                "InvoiceNumber"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Mode",
+                            GetAzulValue(
+                                response,
+                                "EntryMode"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@rnn",
+                            GetAzulValue(
+                                response,
+                                "TransactionReference"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@fechahora",
+                            CombineAzulDateAndTime(
+                                response
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@appid",
+                            GetAzulValue(
+                                response,
+                                "AID"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@holdername",
+                            GetAzulValue(
+                                response,
+                                "CardHolderName"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@terminalid",
+                            GetAzulValue(
+                                response,
+                                "TerminalId"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@merchantid",
+                            GetAzulValue(
+                                response,
+                                "MerchantId"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@acquired",
+                            string.Empty
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@salesIndicator",
+                            GetAzulValue(
+                                response,
+                                "DccIndicator"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@calculationAccepted",
+                            string.Empty
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@marginRate",
+                            GetAzulValue(
+                                response,
+                                "DccMargin"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@amountdcc",
+                            GetAzulValue(
+                                response,
+                                "DccOriginalAmount"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@displayrate",
+                            GetAzulValue(
+                                response,
+                                "DccRate"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@transactioncurr",
+                            GetAzulValue(
+                                response,
+                                "Currency"
+                            )
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Trama_Recibida",
+                            rawResponse ?? string.Empty
+                        );
+
+                        command.Parameters.AddWithValue(
+                            "@Company",
+                            "Azul"
+                        );
+
+                        connection.Open();
+
+                        command.ExecuteNonQuery();
+
+                        Console.WriteLine(
+                            $"AZUL resultado guardado. " +
+                            $"ID={transactionId}, " +
+                            $"Status={status}, " +
+                            $"Intento={attempt}"
+                        );
+
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine(
+                        $"Error guardando respuesta AZUL. " +
+                        $"ID={transactionId}, " +
+                        $"Intento={attempt}/{maxAttempts}. " +
+                        ex.Message
+                    );
+
+                    Log.Error(
+                        ex,
+                        "Error persisting AZUL result. " +
+                        "TransactionId={TransactionId}, " +
+                        "Attempt={Attempt}, " +
+                        "Status={Status}",
+                        transactionId,
+                        attempt,
+                        status
+                    );
+
+                    if (attempt < maxAttempts)
+                    {
+                        Thread.Sleep(
+                            attempt * 1000
+                        );
+                    }
+                }
+            }
+
+            return false;
+        }
         static void SaveAzulUnsupportedTransaction(int transactionId, string transactionType)
         {
             string message = $"Tipo de transaccion Azul no soportado: {transactionType}";
             Console.WriteLine($"TransactionId: {transactionId}. {message}");
-            SaveAzulSaleResult(transactionId, "99", null, message);
+            TrySaveAzulSaleResult(transactionId, "99", null, message);
         }
 
         static string CombineAzulDateAndTime(JObject response)

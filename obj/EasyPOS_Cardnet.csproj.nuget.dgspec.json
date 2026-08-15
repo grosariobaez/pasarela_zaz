@@ -8,7 +8,7 @@
       "version": "1.0.0",
       "restore": {
         "projectUniqueName": "C:\\Users\\caja.A\\ECRtiProject\\EasyPOS_Cardnet.csproj",
-        "projectName": "EasyPOS_Cardnet",
+        "projectName": "EasyPOS_Gateway",
         "projectPath": "C:\\Users\\caja.A\\ECRtiProject\\EasyPOS_Cardnet.csproj",
         "packagesPath": "C:\\Users\\caja.A\\.nuget\\packages\\",
         "outputPath": "C:\\Users\\caja.A\\ECRtiProject\\obj\\",
@@ -72,7 +72,7 @@
             },
             "Microsoft.Extensions.Hosting.WindowsServices": {
               "target": "Package",
-              "version": "[6.0.2, )"
+              "version": "[6.0.0, )"
             },
             "Serilog": {
               "target": "Package",
@@ -106,12 +106,31 @@
           ],
           "assetTargetFallback": true,
           "warn": true,
+          "downloadDependencies": [
+            {
+              "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
+              "version": "[6.0.36, 6.0.36]"
+            },
+            {
+              "name": "Microsoft.NETCore.App.Runtime.win-x64",
+              "version": "[6.0.36, 6.0.36]"
+            },
+            {
+              "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
+              "version": "[6.0.36, 6.0.36]"
+            }
+          ],
           "frameworkReferences": {
             "Microsoft.NETCore.App": {
               "privateAssets": "all"
             }
           },
           "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\6.0.428\\RuntimeIdentifierGraph.json"
+        }
+      },
+      "runtimes": {
+        "win-x64": {
+          "#import": []
         }
       }
     }
