@@ -1460,7 +1460,9 @@ namespace EasyPOS_Cardnet
                         while (reader.Read())
                         {
                             int id = (int)reader["Id"];
-                            ProcessAzulCloseTotals(destino, id);
+                            int? caja = reader["Caja"] == DBNull.Value ? (int?)null : Convert.ToInt32(reader["Caja"], CultureInfo.InvariantCulture);
+                            string usuario = reader["usuario"] == DBNull.Value ? string.Empty : Convert.ToString(reader["usuario"], CultureInfo.InvariantCulture) ?? string.Empty;
+                            ProcessAzulCloseTotals(destino, id, caja, usuario);
                         }
                     }
                 }
@@ -1471,7 +1473,7 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        static void ProcessAzulCloseTotals(string destino, int transactionId)
+        static void ProcessAzulCloseTotals(string destino, int transactionId, int? caja, string usuario)
         {
             AzulHttpResult result = SendAzulRequest("/api/transaction/lane/CloseTotals");
             if (!result.IsValidJson)
@@ -1483,7 +1485,7 @@ namespace EasyPOS_Cardnet
 
             string overallStatus = GetAzulOverallStatus(result.Json, transactionId.ToString(CultureInfo.InvariantCulture));
             LogAzulOperationStatus("Cierre", transactionId.ToString(CultureInfo.InvariantCulture), overallStatus);
-            LogAzulCloseResponse(destino, transactionId, overallStatus, result.Json, result.Body);
+            LogAzulCloseResponse(destino, transactionId, caja, usuario, overallStatus, result.Json, result.Body);
         }
 
         static AzulHttpResult SendAzulRequest(string route)
@@ -2019,7 +2021,7 @@ namespace EasyPOS_Cardnet
             }
         }
 
-        private static void LogAzulCloseResponse(string ipRemota, int idtrn, string status, JObject response, string rawResponse)
+        private static void LogAzulCloseResponse(string ipRemota, int idtrn, int? caja, string usuario, string status, JObject response, string rawResponse)
         {
             string receipt = GetAzulValue(response, "Receipts");
             int salesQuantity = 0;
@@ -2060,6 +2062,22 @@ namespace EasyPOS_Cardnet
                 transactionDateTime = parsedDateTime;
             }
 
+            string detailType = string.Empty;
+            decimal? detailAmount = null;
+            DateTime? detailDateTime = null;
+            string detailCardLast4 = string.Empty;
+            string detailAuthorization = string.Empty;
+            string detailDcc = string.Empty;
+            ParseAzulLastTransactionDetail(
+                receipt,
+                GetAzulValue(response, "Date"),
+                out detailType,
+                out detailAmount,
+                out detailDateTime,
+                out detailCardLast4,
+                out detailAuthorization,
+                out detailDcc);
+
             using (SqlConnection connection = new SqlConnection(connectionString))
             using (SqlCommand command = new SqlCommand("GuardaCierresLote", connection))
             {
@@ -2067,6 +2085,8 @@ namespace EasyPOS_Cardnet
                 command.Parameters.AddWithValue("@IpRemota", ipRemota);
                 command.Parameters.AddWithValue("@CloseResponse", rawResponse ?? string.Empty);
                 command.Parameters.AddWithValue("@IDComunicacion", idtrn);
+                command.Parameters.AddWithValue("@Caja", (object)caja ?? DBNull.Value);
+                command.Parameters.AddWithValue("@Usuario", string.IsNullOrWhiteSpace(usuario) ? (object)DBNull.Value : usuario);
                 command.Parameters.AddWithValue("@Estatus", status ?? string.Empty);
                 command.Parameters.AddWithValue("@TerminalId", terminalId);
                 command.Parameters.AddWithValue("@FechaHora", (object)transactionDateTime ?? DBNull.Value);
@@ -2074,8 +2094,79 @@ namespace EasyPOS_Cardnet
                 command.Parameters.AddWithValue("@Amount", salesAmount);
                 command.Parameters.AddWithValue("@CancelQuantity", cancelQuantity);
                 command.Parameters.AddWithValue("@CancelAmount", cancelAmount);
+                command.Parameters.AddWithValue("@DetailType", detailType);
+                command.Parameters.AddWithValue("@DetailAmount", (object)detailAmount ?? DBNull.Value);
+                command.Parameters.AddWithValue("@DetailDateTime", (object)detailDateTime ?? DBNull.Value);
+                command.Parameters.AddWithValue("@DetailCardLast4", detailCardLast4);
+                command.Parameters.AddWithValue("@DetailAuthorization", detailAuthorization);
+                command.Parameters.AddWithValue("@DetailDcc", detailDcc);
                 connection.Open();
                 command.ExecuteNonQuery();
+            }
+        }
+
+        private static void ParseAzulLastTransactionDetail(
+            string receipt,
+            string responseDate,
+            out string type,
+            out decimal? amount,
+            out DateTime? dateTime,
+            out string cardLast4,
+            out string authorization,
+            out string dcc)
+        {
+            type = string.Empty;
+            amount = null;
+            dateTime = null;
+            cardLast4 = string.Empty;
+            authorization = string.Empty;
+            dcc = string.Empty;
+
+            int year = DateTime.Now.Year;
+            if (DateTime.TryParseExact(responseDate, "yyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime responseDay))
+            {
+                year = responseDay.Year;
+            }
+
+            bool inDetail = false;
+            foreach (string line in (receipt ?? string.Empty).Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+            {
+                if (line.IndexOf("DETALLE DE VENTAS", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    inDetail = true;
+                    continue;
+                }
+
+                if (inDetail && line.IndexOf("FIN DE DETALLE", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    break;
+                }
+
+                if (!inDetail)
+                {
+                    continue;
+                }
+
+                System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(
+                    line,
+                    @"^\s*(\S+)\s+([\d,]+\.\d{2})\s+(\d{4})\s+(\d{4})\s+(\d{4})(?:\s+(\S+))?\s+([NSYN])\s*$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (!match.Success || !decimal.TryParse(match.Groups[2].Value, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal parsedAmount))
+                {
+                    continue;
+                }
+
+                type = match.Groups[1].Value;
+                amount = parsedAmount;
+                cardLast4 = match.Groups[5].Value;
+                authorization = match.Groups[6].Success ? match.Groups[6].Value : string.Empty;
+                dcc = match.Groups[7].Value.ToUpperInvariant();
+
+                string detailDateAndTime = $"{year:0000}{match.Groups[3].Value} {match.Groups[4].Value}";
+                if (DateTime.TryParseExact(detailDateAndTime, "yyyyMMdd HHmm", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime parsedDetailDateTime))
+                {
+                    dateTime = parsedDetailDateTime;
+                }
             }
         }
     }

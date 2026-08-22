@@ -134,6 +134,18 @@ Las anulaciones reutilizan `Voucher_SaveCanceledresult` y los cierres reutilizan
 
 En cierres Azul, el JSON original permanece en `CloseResponse`. El resumen incluido en `Receipts` se parsea para guardar en `ProcessCierreLote` el estado, terminal, fecha/hora, cantidad e importe bruto de ventas, además de la cantidad e importe de anulaciones. El total neto puede obtenerse como `amount - cancelAmount`.
 
+La solicitud de cierre puede identificar la caja y el usuario que la originan. `Caja` usa el mismo tipo `int` de `Procesador_pagos` y `Usuario` conserva el límite existente de tres caracteres:
+
+```sql
+EXEC dbo.CierresLote
+    @IpRemota = '192.168.10.235',
+    @CloseResponse = '',
+    @Caja = 1,
+    @Usuario = 'EDG';
+```
+
+Al completar un cierre Azul, la última línea válida de `DETALLE DE VENTAS` se guarda en los campos `detailType`, `detailAmount`, `detailDateTime`, `detailCardLast4`, `detailAuthorization` y `detailDcc`. El script reproducible para habilitar estas columnas y los parámetros asociados se encuentra en `database/20260822_AzulCloseDetailByRegister.sql`.
+
 ## Organización del código
 
 La solución conserva toda la lógica en `Program.cs`, organizada funcionalmente en estos grupos:
